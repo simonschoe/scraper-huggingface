@@ -1,4 +1,4 @@
-cookie
+.venv/
 output/
 src/__pycache__/
-analysis.ipynb
+cookie

@@ -1,14 +1,15 @@
 """Utility functions for scraping huggingface model repositories"""
 
 import csv
+import json
+import pickle
 import re
 import time
 from ast import literal_eval
 from pathlib import Path
-from typing import List, Tuple, Dict
-import pickle
-import json
+from typing import Dict, List, Tuple
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -38,18 +39,14 @@ def get_repo_links(url: str, fpath: Path = None) -> List[str]:
     next_url = url
     gathered_pages = 0
 
-    # catch errors to store links in case of unexpected exception
-    try:
-        while next_url:
-            links, next_url = scrape_index_page(next_url)
-            all_links += links
-            gathered_pages += 1
-            if fpath:
-                fpath.touch(exist_ok=True)
-                fpath.open('a', encoding='utf-8').writelines([str(nm) + '\n' for nm in links])
-            print(f"Sucessfully scraped p.{gathered_pages} (equals {len(all_links)} links)")
-    except Exception as e:
-        print(type(e), e)
+    while next_url:
+        links, next_url = scrape_index_page(next_url)
+        all_links += links
+        gathered_pages += 1
+        if fpath:
+            fpath.touch(exist_ok=True)
+            fpath.open('a', encoding='utf-8').writelines([str(nm) + '\n' for nm in links])
+        print(f"Sucessfully scraped p.{gathered_pages} (equals {len(all_links)} links)")
 
     return links
 
@@ -61,7 +58,7 @@ def scrape_index_page(url: str) -> Tuple[List[str], str]:
     """
 
     html = requests.get(url, cookies=COOKIES, timeout=10).content
-    html = BeautifulSoup(html, features='lxml')
+    html = BeautifulSoup(html, features='html.parser')
     model_links_html = html.select('article.overview-card-wrapper > a')
 
     # construct full urls to model repositories
@@ -168,9 +165,10 @@ def main_parallel(store_dir: Path, meta_path: Path, links: List[str], like_thld:
         model_dict['downloads'] = download_count
         model_dict['likes'] = like_count
 
+        meta_file_exists = meta_path.is_file()
         with meta_path.open('a', encoding='utf-8') as file:
             writer = csv.DictWriter(file, fieldnames=list(model_dict.keys()))
-            if not meta_path.exists():
+            if not meta_file_exists:
                 writer.writeheader()
             writer.writerow(model_dict)
 
@@ -194,11 +192,11 @@ def get_model(url: str, store_dir: Path) -> Dict:
 
     # return empty dict if request fails
     if model_page.status_code != 200:
-        print(f"\nReceived code {model_page.status_code}")
+        print(f"\nModel page: Received code {model_page.status_code} for {url=}\n-> Repository not found!")
         base_dictionary['model_name'] = model_page.status_code
         return base_dictionary
 
-    model_soup = BeautifulSoup(model_page.content, features='lxml')
+    model_soup = BeautifulSoup(model_page.content, features='html.parser')
 
     # get username
     try:
@@ -210,9 +208,7 @@ def get_model(url: str, store_dir: Path) -> Dict:
     try:
         result_dictionary['model_name'] = model_soup.select('header > div > h1 > div:nth-of-type(2) > a')[0].text.strip()
     except IndexError:
-        # username is missing, not model name -> switch
         result_dictionary['model_name'] = result_dictionary['user']
-        # retrie whole title string
         title_string = model_soup.select('header > div > h1')[0].text.strip()
         result_dictionary['user'] = title_string
 
@@ -227,18 +223,17 @@ def get_model(url: str, store_dir: Path) -> Dict:
     result_dictionary['tags'] = [t.text.strip() for t in tags]
 
     # get no of commit pages
-    model_tree_page = requests.get(url + '/tree/main', cookies=COOKIES, timeout=10)
+    model_tree_page = requests.get(url + '/tree/main?not-for-all-audiences=true', cookies=COOKIES, timeout=10)
     if model_tree_page.status_code != 200:
-        print(f"\nReceived code {model_tree_page.status_code}")
+        print(f"\nModel tree page: Received code {model_tree_page.status_code} for {url=}")
         base_dictionary['commit_history'] = [model_tree_page.status_code]
         return base_dictionary
-    model_tree_page = BeautifulSoup(model_tree_page.content, features='lxml')
+    model_tree_page = BeautifulSoup(model_tree_page.content, features='html.parser')
     try:
         no_of_commits = model_tree_page.select('header > div > a > span')[1].text
         no_of_commits = int(re.match(r'\d+', no_of_commits).group())
         commit_pages = divmod(no_of_commits, 50)[0] # max 50 entries per page
-    except Exception as e:
-        print(type(e), e)
+    except IndexError:
         commit_pages = 0
 
     # get commit history
@@ -246,10 +241,10 @@ def get_model(url: str, store_dir: Path) -> Dict:
     for p in range(0, commit_pages + 1):
         commit_history_page = requests.get(url + f'/commits/main?p={p}', cookies=COOKIES, timeout=10)
         if commit_history_page.status_code != 200:
-            print(f"\nReceived code {commit_history_page.status_code}")
+            print(f"\nCommit history: Received code {commit_history_page.status_code} for {url=}\n-> Lack access permission!")
             base_dictionary['commit_history'] = [commit_history_page.status_code]
             return base_dictionary
-        commit_soup = BeautifulSoup(commit_history_page.content, features='lxml')
+        commit_soup = BeautifulSoup(commit_history_page.content, features='html.parser')
         commits.extend(commit_soup.select('div[data-target="Commit"]'))
         #commits = commit_soup.select('div[data-target="Commit"]')
     commit_data = [json.loads(c['data-props']) for c in commits]
@@ -267,7 +262,7 @@ def get_model(url: str, store_dir: Path) -> Dict:
 
     # add dates to commit dicts
     for idx, commit_dict in enumerate(commit_infos):
-        commit_dict['date'] = commit_dates[idx]
+        commit_dict['commit_date'] = commit_dates[idx]
 
     result_dictionary['commit_history'] = commit_infos
 
@@ -285,12 +280,12 @@ def get_commit_infos(url: str, commit_id: str, store_dir: Path) -> Dict[str, str
     :return: dictionary containing commit data
     """
 
-    results = {'id': commit_id, 'url': url}
+    results = {'commit_id': commit_id, 'commit_url': url}
 
     commit_page = requests.get(url, cookies=COOKIES, timeout=10)
     if commit_page.status_code != 200:
         return commit_page.status_code
-    commit_soup = BeautifulSoup(commit_page.content, features='lxml')
+    commit_soup = BeautifulSoup(commit_page.content, features='html.parser')
 
     # get list of files
     files = commit_soup.select('div[data-target="ViewerIndexTreeList"] > ul > li > div > a')
@@ -312,3 +307,20 @@ def get_commit_infos(url: str, commit_id: str, store_dir: Path) -> Dict[str, str
         results['readme_path'] = ''
 
     return results
+
+
+def load_meta(path: Path) -> pd.DataFrame:
+    """ function to load meta data from CSV file 
+    :param path: path to CSV file
+    :return: pandas DataFrame
+    """
+    meta = pd.read_csv(path)
+
+    # format 'commit_history' column and pivot longer
+    meta['commit_history'] = meta['commit_history'].map(lambda x: literal_eval(x.replace('WindowsPath(', '').replace(')', '')))
+    meta = meta.explode('commit_history', ignore_index=True)
+    meta = pd.concat([meta.drop(columns=['commit_history']), pd.json_normalize(meta['commit_history'])], axis=1)
+
+    # format other columns
+    meta['date'] = pd.to_datetime(meta['date'])
+    return meta
